@@ -1,88 +1,143 @@
+"""HW06: HW05와 Lab05 Exercise 2 기반 자동 Object Counting.
+핵심: Basic Global Thresholding(06장 28쪽), Median, Morphology, Connected Components.
+참고: RGB 색 차이와 조건 분기는 사진 종류에 대응하기 위한 추가 전처리 아이디어임.
+"""
 import numpy as np
-import matplotlib.pyplot as plt
-import scipy.signal as signal
 import scipy.ndimage as nd
 from PIL import Image
+import matplotlib.pyplot as plt
 import streamlit as st
 
-st.title('HW06 - Object Counting')
-#st.write('HW05에서 사용한 Median Filter, Thresholding, Connected Component를 이용합니다.')
 
-# 사진은 웹사이트에서 직접 업로드해서 사용
-uploaded_file = st.file_uploader('분석할 사진을 업로드하세요.', type=['jpg', 'jpeg', 'png'])
+def basic_global_threshold(image, eps=1.0):
+    """Lab05 Exercise 2 / 06장 28p: 두 그룹의 평균으로 임계값 반복 계산."""
+    x = np.asarray(image, dtype=np.float64)
+    T = (float(x.min()) + float(x.max())) / 2
+    for _ in range(100):
+        G1 = x[x > T]
+        G2 = x[x <= T]
+        if len(G1) == 0 or len(G2) == 0:
+            break
+        T_new = (G1.mean() + G2.mean()) / 2
+        if abs(T_new - T) < eps:
+            T = T_new
+            break
+        T = T_new
+    return T
 
-# HW05에서 고정했던 값들을 사진에 맞게 조절할 수 있도록 수정
-st.subheader('영상처리 설정')
-scale = st.selectbox('이미지 축소 간격 (1: 원본, 2: 절반)', [1, 2, 4], index=1)
-filter_size = st.select_slider('Median Filter 크기', options=[1, 3, 5, 7, 9], value=9)
-th_val = st.slider('Threshold', 0, 255, 140)
-direction = st.radio('검출할 물체의 밝기', ['배경보다 밝은 물체 (>)', '배경보다 어두운 물체 (<)'], horizontal=True)
-min_area = st.slider('최소 객체 크기 (픽셀)', 0, 3000, 1000, 10)
 
-if uploaded_file is not None:
-    # 1. grayscale 이미지 읽기 (HW05의 [::2, ::2]를 조절 가능하게 변경)
-    I = Image.open(uploaded_file).convert('L')
-    f = np.array(I)[::scale, ::scale]
+def remove_small_objects(mask):
+    """Retain connected regions that are large enough relative to the image."""
+    label, _ = nd.label(mask)
+    sizes = np.bincount(label.ravel())
+    # HW05와 달리 이미지 크기에 맞춰 최소 픽셀 수를 정함
+    minimum = max(8, round(mask.size * 0.000018))
+    valid_areas = sizes[1:][sizes[1:] >= minimum]
+    if len(valid_areas) >= 3:
+        # 대다수 물체에 비해 지나치게 작은 점은 객체에서 제외
+        minimum = max(minimum, round(float(np.median(valid_areas)) * 0.08))
+    cleaned = (sizes[label] >= minimum) & (label != 0)
+    # 지나치게 큰 배경 영역은 제외
+    label, count = nd.label(cleaned)
+    if count:
+        sizes = np.bincount(label.ravel())
+        cleaned &= (sizes[label] < mask.size * 0.55)
+    return cleaned
 
-    # 2. Median filtering
-    f_denoised = signal.medfilt2d(f, filter_size) if filter_size > 1 else f.copy()
 
-    # 3. Thresholding: 사진에 따라 이진화 방향 선택
-    if direction == '배경보다 밝은 물체 (>)':
-        f_mask = f_denoised > th_val
+def count_objects(image):
+    """Return the intermediate masks and object-counting results."""
+    image.thumbnail((900, 900))
+    rgb = np.asarray(image.convert('RGB'), dtype=np.uint8)
+    # HW05의 Median Filter: 작은 낙엽도 살리기 위해 9x9 대신 3x3 사용
+    rgb_smooth = nd.median_filter(rgb, size=(3, 3, 1))
+    gray = np.asarray(Image.fromarray(rgb_smooth).convert('L'), dtype=np.uint8)
+    h, w = gray.shape
+    margin = max(2, min(h, w) // 35)
+    edge = np.concatenate((
+        rgb_smooth[:margin].reshape(-1, 3),
+        rgb_smooth[-margin:].reshape(-1, 3),
+        rgb_smooth[:, :margin].reshape(-1, 3),
+        rgb_smooth[:, -margin:].reshape(-1, 3),
+    )).astype(np.float32)
+    reference = np.median(edge, axis=0)
+    edge_distance = np.sqrt(np.sum((edge - reference) ** 2, axis=1))
+
+    r = rgb_smooth[:, :, 0].astype(np.float32)
+    g = rgb_smooth[:, :, 1].astype(np.float32)
+    b = rgb_smooth[:, :, 2].astype(np.float32)
+    yellowness = (r + g) / 2 - b
+
+    # 노란색 물체가 두드러지면 R/G와 B의 차이를 사용
+    if np.percentile(yellowness, 99) > 37 and np.percentile(yellowness, 80) < 54 and np.percentile(edge_distance, 75) > 27:
+        score = np.clip(yellowness, 0, 255)
+        threshold = max(13, basic_global_threshold(score))
+        initial = score > threshold
+        method = '색상 차이 + Basic Global Thresholding'
+    elif np.percentile(edge_distance, 75) < 60:
+        delta = np.sqrt(np.sum((rgb_smooth.astype(np.float32) - reference) ** 2, axis=2))
+        score = np.clip(delta, 0, 255)
+        threshold = max(int(np.percentile(edge_distance, 75) * 1.5), 12, basic_global_threshold(score))
+        initial = score > threshold
+        method = '배경 색상 차이 + Basic Global Thresholding'
     else:
-        f_mask = f_denoised < th_val
+        # 배경 밝기가 균일하지 않으면 Gaussian Filter로 배경을 근사
+        smoothed = gray.astype(np.float32)
+        bg = nd.gaussian_filter(smoothed, sigma=max(9, min(h, w) / 38))
+        local_bright = np.maximum(smoothed - bg, 0)
+        local_dark = np.maximum(bg - smoothed, 0)
+        # 영상 가장자리를 덜 차지하는 쪽을 물체 후보로 선택
+        candidates = []
+        for candidate in (local_bright, local_dark):
+            t = max(11, basic_global_threshold(candidate))
+            mask = candidate > t
+            edge_count = np.concatenate((mask[:margin].ravel(), mask[-margin:].ravel(), mask[:, :margin].ravel(), mask[:, -margin:].ravel())).mean()
+            candidates.append((edge_count, mask, t))
+        _, initial, threshold = min(candidates, key=lambda x: x[0])
+        method = '국소 밝기 차이 + Basic Global Thresholding'
 
-    # 4. 작은 영역 제거 후 Connected Component Counting
-    labels, nums = nd.label(f_mask)
-    sizes = np.bincount(labels.ravel())
-    f_mask_clean = sizes[labels] >= min_area
-    f_mask_clean[labels == 0] = False
-    labels, nums = nd.label(f_mask_clean)
+    # Closing: 작은 틈을 메움 (2x2 SE, 최근 Morphology 수업에서 배운 연산)
+    initial = nd.binary_closing(initial, structure=np.ones((2, 2)), border_value=0)
+    cleaned = remove_small_objects(initial)
+    labels, number = nd.label(cleaned)
+    return rgb, gray, initial, cleaned, labels, number, method, threshold
 
-    st.subheader(f'검출된 영역의 개수: {nums}')
-    if nums == 0:
-        st.warning('검출된 물체가 없습니다. Threshold, 최소 객체 크기 또는 이진화 방향을 바꿔보세요.')
 
-    # 처리 단계별 이미지 출력 (HW05와 동일한 구성)
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    axes[0, 0].imshow(f, cmap='gray', vmin=0, vmax=255)
-    axes[0, 0].set_title('Input image')
-    axes[0, 1].imshow(f_denoised, cmap='gray', vmin=0, vmax=255)
-    axes[0, 1].set_title('Median filtered')
-    axes[1, 0].imshow(f_mask, cmap='gray')
-    axes[1, 0].set_title('Binary mask')
-    axes[1, 1].imshow(labels, cmap='Spectral_r')
-    axes[1, 1].set_title('Connected components')
-    for ax in axes.flat:
-        ax.axis('off')
+st.title('HW06 - Object Counting')
+st.write('사진을 업로드하면 자동으로 물체의 개수를 계산합니다.')
+
+uploaded = st.file_uploader('JPG 또는 PNG 사진 업로드', type=['jpg', 'jpeg', 'png'])
+if uploaded is not None:
+    rgb, gray, initial, clean, labels, number, method, threshold = count_objects(Image.open(uploaded))
+    st.subheader(f'검출된 영역의 개수: {number}')
+    st.caption(f'자동 분석 방식: {method} / 임계값: {threshold:.1f}')
+
+    fig, ax = plt.subplots(2, 2, figsize=(10, 8))
+    ax[0, 0].imshow(rgb)
+    ax[0, 0].set_title('Input image')
+    ax[0, 1].imshow(gray, cmap='gray', vmin=0, vmax=255)
+    ax[0, 1].set_title('Median filtered')
+    ax[1, 0].imshow(clean, cmap='gray')
+    ax[1, 0].set_title('Final binary mask')
+    ax[1, 1].imshow(labels, cmap='nipy_spectral')
+    ax[1, 1].set_title('Connected components')
+    for a in ax.flat:
+        a.axis('off')
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
 
-    # 최종 분할 영상도 보여줘서 작은 영역 제거 효과를 비교
-    st.write('작은 영역을 제거한 최종 Binary Mask')
-    st.image((f_mask_clean.astype(np.uint8) * 255), clamp=True)
-
-    # 5. 가장 큰 영역과 작은 영역
-    if nums > 0:
-        cc = np.zeros((nums, 2))
-        for i in range(1, nums + 1):
-            cc[i - 1, 0] = i
-            cc[i - 1, 1] = np.sum(labels == i)
-
-        ind_max = np.argmax(cc[:, 1])
-        ind_min = np.argmin(cc[:, 1])
-
-        fig2, axes2 = plt.subplots(1, 3, figsize=(12, 4))
-        axes2[0].imshow(f, cmap='gray', vmin=0, vmax=255)
-        axes2[0].set_title('Input image')
-        axes2[1].imshow(labels == cc[ind_max, 0], cmap='gray')
-        axes2[1].set_title('Largest component')
-        axes2[2].imshow(labels == cc[ind_min, 0], cmap='gray')
-        axes2[2].set_title('Smallest component')
-        for ax in axes2:
-            ax.axis('off')
+    if number:
+        sizes = np.bincount(labels.ravel())[1:]
+        biggest = int(np.argmax(sizes)) + 1
+        smallest = int(np.argmin(sizes)) + 1
+        fig2, ax2 = plt.subplots(1, 2, figsize=(9, 4))
+        ax2[0].imshow(labels == biggest, cmap='gray')
+        ax2[0].set_title('Largest component')
+        ax2[1].imshow(labels == smallest, cmap='gray')
+        ax2[1].set_title('Smallest component')
+        for a in ax2:
+            a.axis('off')
         fig2.tight_layout()
         st.pyplot(fig2)
         plt.close(fig2)
